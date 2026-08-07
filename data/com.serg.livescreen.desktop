@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=LiveScreen
+Comment=Запись экрана, камеры и звука
+Exec=livescreen
+Icon=com.serg.livescreen
+Terminal=false
+Categories=AudioVideo;
+StartupNotify=true

@@ -1,0 +1,26 @@
+# Rust
+/target/
+
+# AppImage staging and downloaded packaging tools
+/AppDir/
+/tools/
+/LiveScreen-*.AppImage
+
+# Runtime media and diagnostics
+*.mp4
+*.mkv
+*.webm
+*.log
+*.log.*
+*.dot
+*.dot.png
+
+# Local environment and editor state
+.env
+.env.*
+!.env.example
+/.idea/
+/.vscode/
+*.swp
+*~
+.DS_Store
