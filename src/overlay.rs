@@ -313,9 +313,11 @@ pub struct CameraOverlay {
     monitor: Option<gtk::gdk::Monitor>,
     transition: Duration,
     geometry: Rc<Cell<OverlayGeometry>>,
+    border_visible: Rc<Cell<bool>>,
     drag_origin: Cell<(i32, i32)>,
     interactive: Cell<bool>,
     dragging: Cell<bool>,
+    record_toggle_action: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
 impl CameraOverlay {
@@ -386,9 +388,6 @@ impl CameraOverlay {
     }
 
     pub fn configure(&self, position: CameraPosition, size_percent: u8) {
-        if !self.layer_shell {
-            return;
-        }
         let Some(monitor) = self.monitor.as_ref() else {
             return;
         };
@@ -410,9 +409,6 @@ impl CameraOverlay {
     }
 
     pub fn resize(&self, size_percent: u8) {
-        if !self.layer_shell {
-            return;
-        }
         let Some(monitor) = self.monitor.as_ref() else {
             return;
         };
@@ -428,6 +424,15 @@ impl CameraOverlay {
         );
     }
 
+    pub fn set_border_visible(&self, visible: bool) {
+        self.border_visible.set(visible);
+        self.area.queue_draw();
+    }
+
+    pub fn set_record_toggle_action(&self, action: impl Fn() + 'static) {
+        self.record_toggle_action.replace(Some(Rc::new(action)));
+    }
+
     pub fn set_interactive(&self, interactive: bool) {
         self.interactive.set(interactive);
         self.area.set_can_target(interactive);
@@ -435,6 +440,12 @@ impl CameraOverlay {
     }
 
     fn set_geometry(&self, diameter: i32, location: (i32, i32), width: i32, height: i32) {
+        // Обычное окно перемещает оконный менеджер, а круг остаётся в локальном начале.
+        let (width, height) = if self.layer_shell {
+            (width, height)
+        } else {
+            (diameter, diameter)
+        };
         let location = clamp_overlay_location(location, diameter, width, height);
         self.geometry.set(OverlayGeometry {
             x: location.0,
@@ -444,15 +455,13 @@ impl CameraOverlay {
             monitor_height: height,
         });
         self.area.queue_draw();
-        if !self.layer_shell {
-            self.area.set_content_width(diameter);
-            self.area.set_content_height(diameter);
-            self.window.set_default_size(diameter, diameter);
-            return;
-        }
         self.area.set_content_width(width);
         self.area.set_content_height(height);
         self.window.set_default_size(width, height);
+        self.apply_input_region();
+        if !self.layer_shell {
+            return;
+        }
         for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
             self.window.set_anchor(edge, true);
             self.window.set_margin(edge, 0);
@@ -510,7 +519,7 @@ impl CameraOverlay {
         if !self.interactive.get() {
             let input_region = cairo::Region::create();
             surface.set_input_region(Some(&input_region));
-        } else if self.dragging.get() || !self.layer_shell {
+        } else if self.dragging.get() {
             surface.set_input_region(None);
         } else {
             let input_region = circle_input_region(self.geometry.get());
@@ -643,6 +652,7 @@ pub fn create_camera_overlay(
     transparency_percent: u8,
     transition: Duration,
     secondary_transparency_percent: u8,
+    border_visible: bool,
 ) -> Rc<CameraOverlay> {
     let window = gtk::Window::new();
     window.set_decorated(false);
@@ -666,6 +676,8 @@ pub fn create_camera_overlay(
     let frame_for_draw = frame;
     let geometry = Rc::new(Cell::new(OverlayGeometry::default()));
     let geometry_for_draw = geometry.clone();
+    let border_visible = Rc::new(Cell::new(border_visible));
+    let border_visible_for_draw = border_visible.clone();
     area.set_draw_func(move |_, cr, width, height| {
         draw_overlay_camera(
             cr,
@@ -673,6 +685,7 @@ pub fn create_camera_overlay(
             height,
             frame_for_draw.borrow().as_ref(),
             geometry_for_draw.get(),
+            border_visible_for_draw.get(),
         );
     });
     window.set_child(Some(&area));
@@ -708,9 +721,11 @@ pub fn create_camera_overlay(
         monitor,
         transition,
         geometry,
+        border_visible,
         drag_origin: Cell::new((0, 0)),
         interactive: Cell::new(false),
         dragging: Cell::new(false),
+        record_toggle_action: RefCell::new(None),
     });
     overlay.area.set_opacity(primary_alpha);
     overlay.configure(position, size_percent);
@@ -730,11 +745,27 @@ pub fn create_camera_overlay(
     {
         let overlay = Rc::downgrade(&overlay);
         let dragged = dragged.clone();
-        drag.connect_drag_update(move |_, offset_x, offset_y| {
-            if offset_x.abs() > 3.0 || offset_y.abs() > 3.0 {
-                dragged.set(true);
+        drag.connect_drag_update(move |gesture, offset_x, offset_y| {
+            let Some(overlay) = overlay.upgrade() else {
+                return;
+            };
+            if !overlay.interactive.get() {
+                return;
             }
-            if let Some(overlay) = overlay.upgrade() {
+            if (offset_x.abs() > 3.0 || offset_y.abs() > 3.0)
+                && !dragged.replace(true)
+                && !overlay.layer_shell
+                && let Some(toplevel) = overlay
+                    .window
+                    .surface()
+                    .and_downcast::<gtk::gdk::Toplevel>()
+                && let Some(event) = gesture.current_event()
+                && let Some(device) = event.device()
+                && let Some((x, y)) = event.position()
+            {
+                toplevel.begin_move(&device, 1, x, y, event.time());
+            }
+            if overlay.layer_shell {
                 overlay.update_drag(offset_x, offset_y);
             }
         });
@@ -766,6 +797,21 @@ pub fn create_camera_overlay(
         });
     }
     overlay.area.add_controller(click);
+
+    let right_click = gtk::GestureClick::new();
+    right_click.set_button(3);
+    {
+        let overlay = Rc::downgrade(&overlay);
+        right_click.connect_released(move |_, _, _, _| {
+            if let Some(overlay) = overlay.upgrade()
+                && overlay.interactive.get()
+                && let Some(action) = overlay.record_toggle_action.borrow().as_ref()
+            {
+                action();
+            }
+        });
+    }
+    overlay.area.add_controller(right_click);
     overlay.set_interactive(true);
     overlay.window.present();
     let overlay_for_input_region = Rc::downgrade(&overlay);
@@ -783,6 +829,7 @@ fn draw_overlay_camera(
     height: i32,
     frame: Option<&PreviewFrame>,
     geometry: OverlayGeometry,
+    border_visible: bool,
 ) {
     if geometry.diameter > 0 {
         draw_camera_frame(
@@ -791,6 +838,7 @@ fn draw_overlay_camera(
             geometry.x as f64 + 7.0,
             geometry.y as f64 + 7.0,
             (geometry.diameter - 14).max(24) as f64,
+            border_visible,
         );
     } else {
         let diameter = (width.min(height) - 14).max(24) as f64;
@@ -800,6 +848,7 @@ fn draw_overlay_camera(
             (width as f64 - diameter) / 2.0,
             (height as f64 - diameter) / 2.0,
             diameter,
+            border_visible,
         );
     }
 }
@@ -810,6 +859,7 @@ fn draw_camera_frame(
     x: f64,
     y: f64,
     diameter: f64,
+    border_visible: bool,
 ) {
     let center_x = x + diameter / 2.0;
     let center_y = y + diameter / 2.0;
@@ -853,16 +903,18 @@ fn draw_camera_frame(
     }
     let _ = cr.restore();
 
-    cr.set_source_rgba(1.0, 1.0, 1.0, 0.8);
-    cr.set_line_width(2.0);
-    cr.arc(
-        center_x,
-        center_y,
-        diameter / 2.0 - 1.0,
-        0.0,
-        std::f64::consts::TAU,
-    );
-    let _ = cr.stroke();
+    if border_visible {
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.8);
+        cr.set_line_width(2.0);
+        cr.arc(
+            center_x,
+            center_y,
+            diameter / 2.0 - 1.0,
+            0.0,
+            std::f64::consts::TAU,
+        );
+        let _ = cr.stroke();
+    }
 }
 
 #[cfg(test)]
@@ -884,6 +936,42 @@ mod tests {
         let (end, complete) = animation.value(start + Duration::from_millis(2_100));
         assert!(complete);
         assert!((end - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[ignore = "требует отдельного X11 display"]
+    fn x11_camera_resize_keeps_circle_inside_window() {
+        gtk::init().expect("тест требует GTK display");
+        let camera = create_camera_overlay(
+            Rc::new(RefCell::new(None)),
+            CameraPosition::BottomRight,
+            20,
+            0,
+            Duration::ZERO,
+            100,
+            true,
+        );
+        assert!(!camera.layer_shell);
+        let width = camera
+            .monitor
+            .as_ref()
+            .expect("тест требует монитор")
+            .geometry()
+            .width();
+        for percent in [20, 30] {
+            camera.resize(percent);
+            let diameter = ((width as f64 * f64::from(percent) / 100.0).round() as i32).max(64);
+            let geometry = camera.geometry.get();
+            assert_eq!(
+                (geometry.x, geometry.y, geometry.diameter),
+                (0, 0, diameter)
+            );
+            assert_eq!(camera.window.default_size(), (diameter, diameter));
+            let region = circle_input_region(geometry);
+            assert!(region.contains_point(diameter / 2, diameter / 2));
+            assert!(!region.contains_point(0, 0));
+        }
+        camera.window.close();
     }
 
     #[test]

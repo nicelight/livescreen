@@ -1,9 +1,12 @@
 use std::{fs, os::fd::OwnedFd, path::PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use ashpd::desktop::{
-    Session,
-    screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
+use ashpd::{
+    desktop::{
+        Session,
+        screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
+    },
+    enumflags2::BitFlags,
 };
 use tracing::{debug, info};
 
@@ -16,6 +19,10 @@ pub struct PortalStream {
     pub width: i32,
     pub height: i32,
     _session: Session<Screencast>,
+}
+
+fn screencast_source_types() -> BitFlags<SourceType> {
+    SourceType::Monitor.into()
 }
 
 pub fn ensure_desktop_entry() -> Result<()> {
@@ -69,7 +76,7 @@ pub async fn portal_stream() -> Result<PortalStream> {
             &session,
             SelectSourcesOptions::default()
                 .set_cursor_mode(CursorMode::Embedded)
-                .set_sources(SourceType::Monitor | SourceType::Window | SourceType::Virtual)
+                .set_sources(screencast_source_types())
                 .set_multiple(false)
                 .set_persist_mode(ashpd::desktop::PersistMode::DoNot),
         )
@@ -127,5 +134,13 @@ mod tests {
     #[test]
     fn app_id_matches_desktop_entry_contract() {
         assert!(DESKTOP_ENTRY.contains(APP_ID));
+    }
+
+    #[test]
+    fn screencast_offers_monitors_without_window_or_virtual_sources() {
+        assert_eq!(
+            screencast_source_types(),
+            BitFlags::from(SourceType::Monitor)
+        );
     }
 }

@@ -499,7 +499,11 @@ fn main() -> Result<()> {
                 CameraQuality::Fast => "fast",
             },
         );
-        form.attach(&quality_combo, 1, 5, 2, 1);
+        form.attach(&quality_combo, 1, 5, 1, 1);
+        let border_check = gtk::CheckButton::with_label("Рамка");
+        border_check.set_active(saved.camera_border_visible);
+        border_check.set_tooltip_text(Some("Показывать тонкую рамку вокруг Selfie"));
+        form.attach(&border_check, 2, 5, 1, 1);
         form.attach(&label("Selfie ON visible"), 0, 6, 1, 1);
         let opacity_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 100.0, 1.0);
         opacity_scale.set_value(saved.camera_transparency_percent as f64);
@@ -547,6 +551,7 @@ fn main() -> Result<()> {
             saved.camera_transparency_percent,
             Duration::from_millis(portal_for_app.opacity_transition_ms),
             portal_for_app.secondary_transparency_percent,
+            saved.camera_border_visible,
         );
         if !startup_warning_for_app.is_empty() {
             status.set_text(&format!("Предупреждение: {startup_warning_for_app}"));
@@ -625,6 +630,12 @@ fn main() -> Result<()> {
             secondary_opacity_scale.connect_value_changed(move |scale| {
                 let transparency = scale.value().round() as u8;
                 camera_overlay.set_secondary_opacity(transparency);
+            });
+        }
+        {
+            let camera_overlay = camera_overlay.clone();
+            border_check.connect_toggled(move |check| {
+                camera_overlay.set_border_visible(check.is_active());
             });
         }
         {
@@ -754,6 +765,7 @@ fn main() -> Result<()> {
             let opacity_scale = opacity_scale.clone();
             let secondary_opacity_scale = secondary_opacity_scale.clone();
             let quality_combo = quality_combo.clone();
+            let border_check = border_check.clone();
             let mute_button = mute_button.clone();
             let paths = paths_for_app.clone();
             let portal_config = portal_for_app.clone();
@@ -793,6 +805,7 @@ fn main() -> Result<()> {
                         combo_active_id(&quality_combo).as_deref(),
                     ),
                     camera_transparency_percent: opacity_scale.value().round() as u8,
+                    camera_border_visible: border_check.is_active(),
                     record_hotkey: shortcut_bindings.borrow().record.clone(),
                     stop_hotkey: shortcut_bindings.borrow().stop.clone(),
                     mute_hotkey: shortcut_bindings.borrow().mute.clone(),
@@ -827,6 +840,14 @@ fn main() -> Result<()> {
                         error!(error = %error, "Не удалось создать сессию записи");
                         status.set_text(&format!("Не удалось запустить запись: {error:#}"));
                     }
+                }
+            });
+        }
+        {
+            let record_button = record_button.clone();
+            camera_overlay.set_record_toggle_action(move || {
+                if record_button.is_sensitive() {
+                    record_button.emit_clicked();
                 }
             });
         }

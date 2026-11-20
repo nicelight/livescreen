@@ -52,6 +52,8 @@ pub struct UserSettings {
     pub camera_quality: CameraQuality,
     #[serde(default = "default_transparency")]
     pub camera_transparency_percent: u8,
+    #[serde(default = "default_camera_border_visible")]
+    pub camera_border_visible: bool,
     #[serde(default = "default_record_hotkey")]
     pub record_hotkey: String,
     #[serde(default = "default_stop_hotkey")]
@@ -71,6 +73,7 @@ impl Default for UserSettings {
             camera_size_percent: default_size(),
             camera_quality: default_camera_quality(),
             camera_transparency_percent: default_transparency(),
+            camera_border_visible: default_camera_border_visible(),
             record_hotkey: default_record_hotkey(),
             stop_hotkey: default_stop_hotkey(),
             mute_hotkey: default_mute_hotkey(),
@@ -162,6 +165,10 @@ fn default_camera_quality() -> CameraQuality {
 
 fn default_transparency() -> u8 {
     0
+}
+
+fn default_camera_border_visible() -> bool {
+    true
 }
 
 pub trait Validatable {
@@ -388,6 +395,7 @@ mod tests {
         let loaded = read_json::<UserSettings>(&path).expect("missing settings should load");
         assert_eq!(loaded.value.camera_size_percent, 20);
         assert_eq!(loaded.value.camera_quality, CameraQuality::Optim);
+        assert!(loaded.value.camera_border_visible);
         assert_eq!(loaded.value.stop_hotkey, DEFAULT_STOP_HOTKEY);
         assert_eq!(loaded.value.mute_hotkey, DEFAULT_MUTE_HOTKEY);
         assert!(loaded.warning.is_none());
@@ -404,12 +412,13 @@ mod tests {
     }
 
     #[test]
-    fn old_settings_keep_default_mute_hotkey() {
+    fn old_settings_keep_new_defaults() {
         let path = test_dir("old-settings").join("settings.json");
         fs::write(&path, r#"{"record_hotkey":"F3","stop_hotkey":"F4"}"#)
             .expect("old settings should be written");
         let loaded = read_json::<UserSettings>(&path).expect("old settings should load");
         assert_eq!(loaded.value.mute_hotkey, DEFAULT_MUTE_HOTKEY);
+        assert!(loaded.value.camera_border_visible);
         assert!(loaded.warning.is_none());
     }
 
@@ -454,10 +463,14 @@ mod tests {
     fn atomic_write_can_be_read_back_without_leftover_temp_files() {
         let dir = test_dir("atomic");
         let path = dir.join("settings.json");
-        let settings = UserSettings::default();
+        let settings = UserSettings {
+            camera_border_visible: false,
+            ..UserSettings::default()
+        };
         write_json(&path, &settings).expect("settings should be written");
         let loaded = read_json::<UserSettings>(&path).expect("settings should be readable");
         assert_eq!(loaded.value.output_dir, settings.output_dir);
+        assert!(!loaded.value.camera_border_visible);
         let leftovers = fs::read_dir(&dir)
             .expect("test directory should be readable")
             .filter_map(|entry| entry.ok())
