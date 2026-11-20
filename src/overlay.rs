@@ -561,6 +561,45 @@ fn circle_input_region(geometry: OverlayGeometry) -> cairo::Region {
     cairo::Region::create_rectangles(&rectangles)
 }
 
+/// На X11 просит оконный менеджер оставить показанный overlay поверх обычных окон.
+fn present_overlay(window: &gtk::Window) {
+    window.present();
+    if let Some(surface) = window.surface().and_downcast::<gdk4_x11::X11Surface>()
+        && let Err(error) = keep_x11_overlay_above(&surface)
+    {
+        tracing::warn!(title = ?window.title(), %error, "Не удалось закрепить окно поверх других окон X11");
+    }
+}
+
+fn keep_x11_overlay_above(surface: &gdk4_x11::X11Surface) -> anyhow::Result<()> {
+    use x11rb::{connection::Connection, protocol::xproto::*};
+
+    let display = surface.display();
+    // Запрос map от GDK должен дойти до X-сервера раньше сообщения по второму соединению.
+    display.sync();
+    let (connection, screen) = x11rb::connect(Some(display.name().as_str()))?;
+    let root = connection.setup().roots[screen].root;
+    let state = connection
+        .intern_atom(false, b"_NET_WM_STATE")?
+        .reply()?
+        .atom;
+    let above = connection
+        .intern_atom(false, b"_NET_WM_STATE_ABOVE")?
+        .reply()?
+        .atom;
+    // EWMH: добавить состояние ABOVE от имени приложения.
+    let event = ClientMessageEvent::new(32, surface.xid().try_into()?, state, [1, above, 0, 1, 0]);
+    connection
+        .send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        )?
+        .check()?;
+    Ok(())
+}
+
 pub fn create_recording_indicator_overlay() -> Rc<RecordingIndicatorOverlay> {
     let window = gtk::Window::new();
     window.set_decorated(false);
@@ -641,7 +680,7 @@ pub fn create_recording_indicator_overlay() -> Rc<RecordingIndicatorOverlay> {
         showing_stop: Cell::new(false),
         layer_shell,
     });
-    indicator.window.present();
+    present_overlay(&indicator.window);
     indicator
 }
 
@@ -813,7 +852,7 @@ pub fn create_camera_overlay(
     }
     overlay.area.add_controller(right_click);
     overlay.set_interactive(true);
-    overlay.window.present();
+    present_overlay(&overlay.window);
     let overlay_for_input_region = Rc::downgrade(&overlay);
     glib::idle_add_local_once(move || {
         if let Some(overlay) = overlay_for_input_region.upgrade() {
@@ -939,8 +978,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "требует отдельного X11 display"]
-    fn x11_camera_resize_keeps_circle_inside_window() {
+    #[ignore = "требует отдельного X11 display с EWMH window manager"]
+    fn x11_overlay_size_and_stacking() {
         gtk::init().expect("тест требует GTK display");
         let camera = create_camera_overlay(
             Rc::new(RefCell::new(None)),
@@ -971,6 +1010,88 @@ mod tests {
             assert!(region.contains_point(diameter / 2, diameter / 2));
             assert!(!region.contains_point(0, 0));
         }
+        let indicator = create_recording_indicator_overlay();
+        let xid = |window: &gtk::Window| -> u32 {
+            window
+                .surface()
+                .and_downcast::<gdk4_x11::X11Surface>()
+                .unwrap()
+                .xid()
+                .try_into()
+                .unwrap()
+        };
+        let overlays = [xid(&camera.window), xid(&indicator.window)];
+
+        // Отдельный X11-клиент получает фокус уже после появления обоих overlay.
+        use x11rb::{connection::Connection, protocol::xproto::*};
+        let (client, screen) = x11rb::connect(None).unwrap();
+        let root = client.setup().roots[screen].root;
+        let peer = client.generate_id().unwrap();
+        client
+            .create_window(
+                0,
+                peer,
+                root,
+                0,
+                0,
+                400,
+                300,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new(),
+            )
+            .unwrap();
+        client.map_window(peer).unwrap();
+        let atom = |name: &[u8]| {
+            client
+                .intern_atom(false, name)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .atom
+        };
+        let active = atom(b"_NET_ACTIVE_WINDOW");
+        let stacking = atom(b"_NET_CLIENT_LIST_STACKING");
+        let activate = ClientMessageEvent::new(32, peer, active, [2, 0, 0, 0, 0]);
+        client
+            .send_event(
+                false,
+                root,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                activate,
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        let windows = |property| {
+            client
+                .get_property(false, root, property, AtomEnum::WINDOW, 0, u32::MAX)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .value32()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            while glib::MainContext::default().iteration(false) {}
+            let stack = windows(stacking);
+            if windows(active) == [peer]
+                && let Some(index) = stack.iter().position(|id| *id == peer)
+                && overlays.iter().all(|id| stack[index + 1..].contains(id))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "overlay должны быть выше активного окна: {stack:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        indicator.close();
         camera.window.close();
     }
 
